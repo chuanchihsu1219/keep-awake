@@ -1,0 +1,1 @@
+﻿coffee.png = Twitter Twemoji U+2615 (HOT BEVERAGE). License: CC-BY 4.0. Source: https://github.com/twitter/twemoji
