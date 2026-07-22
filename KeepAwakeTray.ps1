@@ -10,6 +10,15 @@ $ErrorActionPreference = 'Stop'
 $root   = Split-Path -Parent $MyInvocation.MyCommand.Path
 $marker = Join-Path $root 'state.on'
 $errlog = Join-Path $root 'error.log'
+$actlog = Join-Path $root 'activity.log'
+function Log([string]$m) {
+    try {
+        if ((Test-Path $actlog) -and ((Get-Item $actlog).Length -gt 262144)) {
+            Set-Content -Path $actlog -Value (Get-Content $actlog -Tail 300 -Encoding UTF8) -Encoding UTF8   # 超過 256KB 只留最後 300 行
+        }
+        Add-Content -Path $actlog -Value ("[{0}] {1}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $m) -Encoding UTF8
+    } catch {}
+}
 
 try {
     Add-Type -AssemblyName System.Windows.Forms
@@ -262,8 +271,10 @@ public class KA_LidWatcher : NativeWindow, IDisposable {
         $lbl = Mode-Label $script:st.Mode
         if ($script:st.Minutes -gt 0) {
             Show-Toast "Claude 續跑：已闔上，開始倒數（$lbl）⏳" '時間到、若你人不在就讓筆電睡眠；提早掀開會立即還原。'
+            Log ("闔上 → 開始倒數（{0}），到期 {1}" -f $lbl, $script:st.Expiry.ToString('yyyy-MM-dd HH:mm'))
         } else {
             Show-Toast 'Claude 續跑：已闔上，持續續跑中' '會跑到電量過低自動休眠；掀開或手動可提早關閉。'
+            Log "闔上 → 持續續跑（直到電力耗盡）"
         }
     }
 
@@ -275,6 +286,7 @@ public class KA_LidWatcher : NativeWindow, IDisposable {
         Update-UI
         $lbl = Mode-Label $mode
         Show-Toast "Claude 續跑：已開啟（$lbl）✅" '闔上筆電後開始倒數；5 分鐘內沒闔上會自動取消並還原。'
+        Log "開啟：$lbl（待闔上）"
         # 已經闔著（clamshell）或沒有 lid 感測器 → 立即開始倒數
         if ((Get-Lid) -eq 0 -or (-not $script:lid)) { Start-Count }
     }
@@ -284,6 +296,7 @@ public class KA_LidWatcher : NativeWindow, IDisposable {
         Reset-State
         Update-UI
         Show-Toast 'Claude 續跑：已自動取消' '你 5 分鐘內沒有闔上筆電，已取消續跑並還原設定。'
+        Log "5 分鐘未闔上 → 自動取消並還原"
     }
 
     function Turn-Off([string]$reason) {
@@ -291,6 +304,7 @@ public class KA_LidWatcher : NativeWindow, IDisposable {
         Restore-Normal
         Reset-State
         Update-UI
+        Log ("{0} → 還原（本次續跑 {1} 分）" -f $(if ($reason -eq 'lid') { '掀開筆電' } elseif ($reason -eq 'manual') { '手動關閉' } else { $reason }), $mins)
         switch ($reason) {
             'manual' { Show-Toast 'Claude 續跑：已關閉' "本次續跑約 $mins 分鐘，電源設定已還原正常。" }
             'lid'    { Show-Toast 'Claude 續跑：偵測到你掀開筆電 👋' "本次續跑約 $mins 分鐘，已成功還原電源設定 ✅。" }
@@ -305,7 +319,9 @@ public class KA_LidWatcher : NativeWindow, IDisposable {
         Restore-Normal
         Reset-State
         Update-UI
-        if ($lidClosed -and $idle -ge 60) {
+        $willSleep = ($lidClosed -and $idle -ge 60)
+        Log ("到期 → 還原（續跑 {0} 分）；睡眠={1}（闔蓋={2} 閒置={3}秒）" -f $mins, $willSleep, $lidClosed, [int]$idle)
+        if ($willSleep) {
             Show-Toast "Claude 續跑：時間到（跑了約 $mins 分）💤" '已還原電源設定，讓筆電進入睡眠。'
             Start-Sleep -Milliseconds 700
             [void][System.Windows.Forms.Application]::SetSuspendState([System.Windows.Forms.PowerState]::Suspend, $false, $false)
@@ -327,6 +343,7 @@ public class KA_LidWatcher : NativeWindow, IDisposable {
     $miBatt.add_Click({ Arm 'batt' 0 })
     $miOff.add_Click({ if ($script:st.Phase -ne 'off') { Turn-Off 'manual' } })
     $miExit.add_Click({
+        Log "使用者結束程式"
         try { $script:timer.Stop() } catch {}
         if ($script:st.Phase -ne 'off') { Restore-Normal }
         Reset-State
@@ -362,8 +379,10 @@ public class KA_LidWatcher : NativeWindow, IDisposable {
         Restore-Normal
         Remove-Item $marker -Force -ErrorAction SilentlyContinue
         Show-Toast 'Claude 續跑：開機自動還原 ✅' '上次結束時仍在續跑模式，已幫你還原正常。'
+        Log "開機偵測到上次未正常結束 → 已還原"
     }
     Update-UI
+    Log "啟動（PID $PID）"
 
     [System.Windows.Forms.Application]::add_ApplicationExit({ try { if ($script:st.Phase -ne 'off') { Restore-Normal } } catch {} })
     [System.Windows.Forms.Application]::Run()

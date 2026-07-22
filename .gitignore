@@ -1,6 +1,7 @@
 # 執行期產生的檔案，不納入版控
 state.on
 error.log
+activity.log
 debug.log
 _dbg.txt
 *.tmp
