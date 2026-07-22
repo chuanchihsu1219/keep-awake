@@ -11,7 +11,7 @@ $root   = Split-Path -Parent $MyInvocation.MyCommand.Path
 $marker = Join-Path $root 'state.on'
 $errlog = Join-Path $root 'error.log'
 $actlog = Join-Path $root 'activity.log'
-# 兩類：[動作]=程式或你觸發的操作、[狀態]=偵測到的電腦狀態（闔蓋/掀蓋/閒置）
+# 兩類：[動作]=程式或你觸發的操作、[狀態]=偵測到的電腦狀態（闔蓋/掀蓋/閒置/電源/睡眠喚醒）
 function Log([string]$cat, [string]$m) {
     try {
         if (-not (Test-Path $actlog)) {
@@ -41,7 +41,18 @@ try {
     $script:mtx = New-Object System.Threading.Mutex($true, 'Global\ClaudeKeepAwakeTray', [ref]$mtxCreated)
     if (-not $mtxCreated) { return }
 
-    # ---- 電源設定核心 ----
+    # ---- 目前電源（插電 / 電池 %）----
+    function Power-Status {
+        try {
+            $ps = [System.Windows.Forms.SystemInformation]::PowerStatus
+            if ($ps.PowerLineStatus -eq 'Online') { return '插電' }
+            $pct = [int]($ps.BatteryLifePercent * 100)
+            if ($pct -gt 100) { return '電池（未知%）' }
+            return "電池 $pct%"
+        } catch { return '未知' }
+    }
+
+    # ---- 電源設定核心（並記錄實際改了哪兩個設定，當安全佐證）----
     $SUB = 'SUB_BUTTONS'
     $LidGuid = '5ca83367-6e45-459f-a27b-476b1d01c936'    # 闔蓋動作；勿用 $LID（會與 $lid 大小寫撞名）
     function Set-Lid([int]$v) {
@@ -52,11 +63,13 @@ try {
         Set-Lid 0
         powercfg /change standby-timeout-dc 0 | Out-Null
         powercfg /setactive SCHEME_CURRENT | Out-Null
+        Log '動作' '套用電源設定：闔蓋動作＝不做任何動作、電池閒置＝永不睡眠'
     }
     function Restore-Normal {
         Set-Lid 1
         powercfg /change standby-timeout-dc 5 | Out-Null
         powercfg /setactive SCHEME_CURRENT | Out-Null
+        Log '動作' '還原電源設定：闔蓋動作＝睡眠、電池閒置＝5 分鐘睡眠'
     }
 
     # ---- Windows 11 原生 toast ----
@@ -86,9 +99,8 @@ try {
         } catch {}
     }
 
-    # ---- 系統匣圖示：咖啡杯（綠冒煙＝續跑中 / 灰無煙＝關閉），圓底貼邊填滿、依 DPI 尺寸繪製 ----
+    # ---- 系統匣圖示：coffee.png（Twemoji ☕，CC-BY 4.0）彩色=續跑 / 灰階=關閉；找不到就退回手繪杯 ----
     function New-CupIcon([bool]$on) {
-        # 畫大一點的畫布再讓系統縮到托盤格子，確保夠大又銳利
         $w = [Math]::Max(32, [System.Windows.Forms.SystemInformation]::SmallIconSize.Width * 2)
         $bmp = New-Object System.Drawing.Bitmap $w, $w
         $g = [System.Drawing.Graphics]::FromImage($bmp)
@@ -96,8 +108,7 @@ try {
         $g.Clear([System.Drawing.Color]::Transparent)
         $u = $w / 24.0
         $disc = if ($on) { [System.Drawing.Color]::FromArgb(255, 34, 197, 94) } else { [System.Drawing.Color]::FromArgb(255, 120, 124, 132) }
-        $bd = New-Object System.Drawing.SolidBrush $disc
-        $g.FillEllipse($bd, [single](0.2 * $u), [single](0.2 * $u), [single](23.6 * $u), [single](23.6 * $u))   # 圓底貼邊填滿
+        $g.FillEllipse((New-Object System.Drawing.SolidBrush $disc), [single](0.2 * $u), [single](0.2 * $u), [single](23.6 * $u), [single](23.6 * $u))
         $white = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::White)
         $pen = New-Object System.Drawing.Pen ([System.Drawing.Color]::White), ([single](2.2 * $u))
         $pen.StartCap = [System.Drawing.Drawing2D.LineCap]::Round; $pen.EndCap = [System.Drawing.Drawing2D.LineCap]::Round
@@ -107,17 +118,15 @@ try {
             (New-Object System.Drawing.PointF([single](15.2 * $u), [single](18.5 * $u))),
             (New-Object System.Drawing.PointF([single](7.8 * $u), [single](18.5 * $u)))
         )
-        $g.FillPolygon($white, $pts)                                             # 杯身（放大）
-        $g.DrawArc($pen, [single](16 * $u), [single](9.5 * $u), [single](5.5 * $u), [single](5.5 * $u), -80, 160)   # 把手
+        $g.FillPolygon($white, $pts)
+        $g.DrawArc($pen, [single](16 * $u), [single](9.5 * $u), [single](5.5 * $u), [single](5.5 * $u), -80, 160)
         if ($on) {
-            $g.DrawLine($pen, [single](9.5 * $u), [single](4 * $u), [single](9.5 * $u), [single](7.5 * $u))    # 熱氣
+            $g.DrawLine($pen, [single](9.5 * $u), [single](4 * $u), [single](9.5 * $u), [single](7.5 * $u))
             $g.DrawLine($pen, [single](13.5 * $u), [single](4 * $u), [single](13.5 * $u), [single](7.5 * $u))
         }
         $g.Dispose()
         return [System.Drawing.Icon]::FromHandle($bmp.GetHicon())
     }
-
-    # 用 coffee.png（Twemoji ☕，CC-BY 4.0）做圖示：彩色＝續跑中、灰階＝關閉；找不到檔就退回手繪杯
     function New-CoffeeIcon([bool]$on) {
         $png = Join-Path $root 'coffee.png'
         if (-not (Test-Path $png)) { return New-CupIcon $on }
@@ -130,9 +139,8 @@ try {
             $g.Clear([System.Drawing.Color]::Transparent)
             $src = New-Object System.Drawing.Bitmap $png
             $dr = New-Object System.Drawing.Rectangle 0, 0, $w, $w
-            $m = 0   # Twemoji 內容已填滿整張、無留白，不可裁切否則會切到杯緣
             if ($on) {
-                $g.DrawImage($src, $dr, $m, $m, ($src.Width - 2 * $m), ($src.Height - 2 * $m), [System.Drawing.GraphicsUnit]::Pixel)
+                $g.DrawImage($src, $dr, 0, 0, $src.Width, $src.Height, [System.Drawing.GraphicsUnit]::Pixel)
             } else {
                 $cm = New-Object System.Drawing.Imaging.ColorMatrix
                 $cm.Matrix00 = 0.30; $cm.Matrix01 = 0.30; $cm.Matrix02 = 0.30
@@ -141,7 +149,7 @@ try {
                 $cm.Matrix33 = 0.85
                 $ia = New-Object System.Drawing.Imaging.ImageAttributes
                 $ia.SetColorMatrix($cm)
-                $g.DrawImage($src, $dr, $m, $m, ($src.Width - 2 * $m), ($src.Height - 2 * $m), [System.Drawing.GraphicsUnit]::Pixel, $ia)
+                $g.DrawImage($src, $dr, 0, 0, $src.Width, $src.Height, [System.Drawing.GraphicsUnit]::Pixel, $ia)
             }
             $src.Dispose(); $g.Dispose()
             return [System.Drawing.Icon]::FromHandle($bmp.GetHicon())
@@ -153,9 +161,11 @@ try {
     # ---- 狀態機：off → armed（待闔上）→ counting（倒數中）----
     $script:st = @{ Phase = 'off'; Mode = $null; Minutes = 0; Expiry = $null; ArmStart = $null; Start = $null }
     $script:prevLid = $null
+    $script:prevResume = 0
+    $script:lastBeat = $null
     $script:armTimeoutMin = 5
 
-    # ---- Lid 感測器 + 閒置偵測 ----
+    # ---- Lid 感測器 + 閒置偵測 + 睡眠/喚醒偵測 ----
     $script:lid = $null
     try {
         Add-Type -ReferencedAssemblies 'System.Windows.Forms' -TypeDefinition @'
@@ -180,19 +190,32 @@ public class KA_LidWatcher : NativeWindow, IDisposable {
     }
     const int WM_POWERBROADCAST = 0x0218;
     const int PBT_POWERSETTINGCHANGE = 0x8013;
+    const int PBT_APMSUSPEND = 0x0004;
+    const int PBT_APMRESUMESUSPEND = 0x0007;
+    const int PBT_APMRESUMEAUTOMATIC = 0x0012;
     static Guid LID = new Guid("ba3e0f4d-b817-4094-a2d1-d56379e6a0f3");
     [StructLayout(LayoutKind.Sequential)]
     struct PBS { public Guid PowerSetting; public uint DataLength; public byte Data; }
     IntPtr hReg = IntPtr.Zero;
-    public int LidState = -1;   // 1=開, 0=闔
+    public int LidState = -1;             // 1=開, 0=闔
+    public int ResumeCount = 0;           // 每次從睡眠喚醒 +1
+    public DateTime SuspendAt = DateTime.MinValue;
+    public DateTime ResumeAt = DateTime.MinValue;
     public KA_LidWatcher() {
         this.CreateHandle(new CreateParams());
         hReg = RegisterPowerSettingNotification(this.Handle, ref LID, 0);
     }
     protected override void WndProc(ref Message m) {
-        if (m.Msg == WM_POWERBROADCAST && m.WParam.ToInt32() == PBT_POWERSETTINGCHANGE && m.LParam != IntPtr.Zero) {
-            PBS s = (PBS)Marshal.PtrToStructure(m.LParam, typeof(PBS));
-            if (s.PowerSetting == LID) LidState = (int)s.Data;
+        if (m.Msg == WM_POWERBROADCAST) {
+            int ev = m.WParam.ToInt32();
+            if (ev == PBT_POWERSETTINGCHANGE && m.LParam != IntPtr.Zero) {
+                PBS s = (PBS)Marshal.PtrToStructure(m.LParam, typeof(PBS));
+                if (s.PowerSetting == LID) LidState = (int)s.Data;
+            } else if (ev == PBT_APMSUSPEND) {
+                SuspendAt = DateTime.Now;
+            } else if (ev == PBT_APMRESUMEAUTOMATIC || ev == PBT_APMRESUMESUSPEND) {
+                ResumeAt = DateTime.Now; ResumeCount++;
+            }
         }
         base.WndProc(ref m);
     }
@@ -265,13 +288,16 @@ public class KA_LidWatcher : NativeWindow, IDisposable {
     function Reset-State {
         $script:st.Phase = 'off'; $script:st.Mode = $null; $script:st.Minutes = 0
         $script:st.Expiry = $null; $script:st.ArmStart = $null; $script:st.Start = $null
+        $script:lastBeat = $null
         if (Test-Path $marker) { Remove-Item $marker -Force -ErrorAction SilentlyContinue }
     }
 
     function Start-Count {
         $script:st.Phase = 'counting'
         $script:st.Expiry = if ($script:st.Minutes -gt 0) { [DateTime]::Now.AddMinutes($script:st.Minutes) } else { $null }
+        $script:lastBeat = [DateTime]::Now
         Update-UI
+        Log '狀態' ("開始續跑，電源：{0}" -f (Power-Status))
         $lbl = Mode-Label $script:st.Mode
         if ($script:st.Minutes -gt 0) {
             Show-Toast "Claude 續跑：已闔上，開始倒數（$lbl）⏳" '時間到、若你人不在就讓筆電睡眠；提早掀開會立即還原。'
@@ -291,6 +317,7 @@ public class KA_LidWatcher : NativeWindow, IDisposable {
         $lbl = Mode-Label $mode
         Show-Toast "Claude 續跑：已開啟（$lbl）✅" '闔上筆電後開始倒數；5 分鐘內沒闔上會自動取消並還原。'
         Log '動作' "開啟續跑：$lbl（等你闔上筆電後開始倒數）"
+        Log '狀態' ("接管當下電源：{0}" -f (Power-Status))
         # 已經闔著（clamshell）或沒有 lid 感測器 → 立即開始倒數
         if ((Get-Lid) -eq 0 -or (-not $script:lid)) { Start-Count }
     }
@@ -300,7 +327,7 @@ public class KA_LidWatcher : NativeWindow, IDisposable {
         Reset-State
         Update-UI
         Show-Toast 'Claude 續跑：已自動取消' '你 5 分鐘內沒有闔上筆電，已取消續跑並還原設定。'
-        Log '動作' '超過 5 分鐘沒闔上，自動取消並還原設定'
+        Log '動作' '超過 5 分鐘沒闔上，自動取消'
     }
 
     function Turn-Off([string]$reason) {
@@ -308,30 +335,32 @@ public class KA_LidWatcher : NativeWindow, IDisposable {
         Restore-Normal
         Reset-State
         Update-UI
-        Log '動作' ("{0}已還原電源設定（本次續跑 {1} 分）" -f $(if ($reason -eq 'manual') { '你手動關閉，' } else { '' }), $mins)
         switch ($reason) {
-            'manual' { Show-Toast 'Claude 續跑：已關閉' "本次續跑約 $mins 分鐘，電源設定已還原正常。" }
-            'lid'    { Show-Toast 'Claude 續跑：偵測到你掀開筆電 👋' "本次續跑約 $mins 分鐘，已成功還原電源設定 ✅。" }
+            'manual' { Show-Toast 'Claude 續跑：已關閉' "本次續跑約 $mins 分鐘，電源設定已還原正常。"; Log '動作' ("你手動關閉續跑（本次續跑 {0} 分）" -f $mins) }
+            'lid'    { Show-Toast 'Claude 續跑：偵測到你掀開筆電 👋' "本次續跑約 $mins 分鐘，已成功還原電源設定 ✅。"; Log '動作' ("結束續跑（本次續跑 {0} 分）" -f $mins) }
             default  { }
         }
     }
 
     function Expire-Timer {
         $mins = Elapsed-Min
+        $planned = $script:st.Expiry
         $lidClosed = ((Get-Lid) -eq 0)
         $idle = try { [KA_LidWatcher]::IdleSeconds() } catch { 999 }
+        $pw = Power-Status
         Restore-Normal
         Reset-State
         Update-UI
         $willSleep = ($lidClosed -and $idle -ge 60)
-        Log '狀態' ("到期檢查：筆電闔上={0}、閒置 {1} 秒" -f $(if ($lidClosed) { '是' } else { '否' }), [int]$idle)
-        Log '動作' ("時間到，已還原設定{0}（本次續跑 {1} 分）" -f $(if ($willSleep) { '並讓筆電睡眠' } else { '；因你還在使用，未睡眠' }), $mins)
+        Log '狀態' ("倒數到期：預定 {0}、實際 {1}、筆電闔上={2}、閒置 {3} 秒、電源：{4}" -f $planned.ToString('HH:mm'), (Get-Date -Format 'HH:mm'), $(if ($lidClosed) { '是' } else { '否' }), [int]$idle, $pw)
         if ($willSleep) {
             Show-Toast "Claude 續跑：時間到（跑了約 $mins 分）💤" '已還原電源設定，讓筆電進入睡眠。'
+            Log '狀態' ("依預定時間讓電腦進入睡眠（{0}）" -f (Get-Date -Format 'HH:mm'))
             Start-Sleep -Milliseconds 700
             [void][System.Windows.Forms.Application]::SetSuspendState([System.Windows.Forms.PowerState]::Suspend, $false, $false)
         } else {
             Show-Toast "Claude 續跑：時間到（跑了約 $mins 分）✅" '偵測到你還在使用（筆電掀開／剛有操作），只還原設定、沒讓它睡。'
+            Log '動作' ("時間到，但你還在使用，未讓電腦睡眠（本次續跑 {0} 分）" -f $mins)
         }
     }
 
@@ -357,10 +386,19 @@ public class KA_LidWatcher : NativeWindow, IDisposable {
         [System.Windows.Forms.Application]::ExitThread()
     })
 
-    # ---- 主計時器（每 5 秒）：偵測闔蓋/掀蓋、arm 逾時、倒數到期 ----
+    # ---- 主計時器（每 5 秒）：喚醒偵測、闔蓋/掀蓋、arm 逾時、倒數到期、續跑中心跳 ----
     $script:timer = New-Object System.Windows.Forms.Timer
     $script:timer.Interval = 5000
     $script:timer.add_Tick({
+        # 從睡眠喚醒
+        if ($script:lid -and $script:lid.ResumeCount -gt $script:prevResume) {
+            $script:prevResume = $script:lid.ResumeCount
+            if ($script:lid.SuspendAt -ne [DateTime]::MinValue -and $script:lid.ResumeAt -gt $script:lid.SuspendAt) {
+                Log '狀態' ("電腦已從睡眠喚醒（睡了 {0} 分）" -f [int][math]::Round(($script:lid.ResumeAt - $script:lid.SuspendAt).TotalMinutes))
+            } else {
+                Log '狀態' '電腦已從睡眠喚醒'
+            }
+        }
         $cur = Get-Lid
         if ($cur -ge 0 -and $null -eq $script:prevLid) { $script:prevLid = $cur }
         $opened = ($cur -eq 1 -and $script:prevLid -eq 0)
@@ -373,7 +411,14 @@ public class KA_LidWatcher : NativeWindow, IDisposable {
             'counting' {
                 if ($opened) { Log '狀態' '偵測到筆電掀開'; Turn-Off 'lid' }
                 elseif ($script:st.Expiry -and [DateTime]::Now -ge $script:st.Expiry) { Expire-Timer }
-                else { Update-UI }
+                else {
+                    if (($null -eq $script:lastBeat) -or (([DateTime]::Now - $script:lastBeat).TotalMinutes -ge 15)) {
+                        $script:lastBeat = [DateTime]::Now
+                        $rem = if ($script:st.Expiry) { "剩 $([int][math]::Ceiling(($script:st.Expiry - [DateTime]::Now).TotalMinutes)) 分" } else { '直到電力耗盡' }
+                        Log '狀態' ("續跑中… 電源：{0}，{1}" -f (Power-Status), $rem)
+                    }
+                    Update-UI
+                }
             }
         }
     })
@@ -388,6 +433,8 @@ public class KA_LidWatcher : NativeWindow, IDisposable {
     }
     Update-UI
     Log '動作' '程式啟動，待命中'
+    Log '狀態' ("筆電開合感測器：{0}" -f $(if ($script:lid) { '正常' } else { '無法讀取（將以「按下即倒數」運作）' }))
+    Log '狀態' ("目前電源：{0}" -f (Power-Status))
 
     [System.Windows.Forms.Application]::add_ApplicationExit({ try { if ($script:st.Phase -ne 'off') { Restore-Normal } } catch {} })
     [System.Windows.Forms.Application]::Run()
