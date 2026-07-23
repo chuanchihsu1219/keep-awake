@@ -5,22 +5,48 @@
 #       ‧ 倒數中你掀開筆電 → 立即還原並通知（含本次續跑時長）
 #       ‧ 開機時若上次沒正常結束 → 自動還原並通知
 # 只改 powercfg「闔蓋動作」+「電池閒置睡眠」，不需系統管理員權限。
+# activity.log：每行 [動作]/[狀態] + 時間戳 + 電池/充電狀態；睡眠/喚醒由背景元件與主程式共同記錄。
 
 $ErrorActionPreference = 'Stop'
 $root   = Split-Path -Parent $MyInvocation.MyCommand.Path
 $marker = Join-Path $root 'state.on'
 $errlog = Join-Path $root 'error.log'
 $actlog = Join-Path $root 'activity.log'
-# 兩類：[動作]=程式或你觸發的操作、[狀態]=偵測到的電腦狀態（闔蓋/掀蓋/閒置/電源/睡眠喚醒）
+
+# 讀電池/充電狀態（給每行 log 用；底層 GetSystemPowerStatus，每次即時讀）
+try {
+    Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public class KA_Pwr {
+    [StructLayout(LayoutKind.Sequential)]
+    struct SPS { public byte ac; public byte flag; public byte pct; public byte sys; public int t1; public int t2; }
+    [DllImport("kernel32.dll")] static extern bool GetSystemPowerStatus(out SPS s);
+    public static string Tag() {
+        SPS s;
+        if (!GetSystemPowerStatus(out s)) return "電源未知";
+        if (s.ac == 1) return "插電";
+        if (s.pct <= 100) return "電池 " + s.pct + "%";
+        return "電池";
+    }
+}
+'@
+} catch {}
+function Get-PowerTag { try { return [KA_Pwr]::Tag() } catch { return '' } }
+
+# 兩類：[動作]=程式或你觸發的操作、[狀態]=偵測到的電腦狀態；每行結尾附電池/充電
 function Log([string]$cat, [string]$m) {
     try {
         if (-not (Test-Path $actlog)) {
-            Add-Content -Path $actlog -Value '# Claude 續跑模式 活動記錄　—　[動作]=程式/你觸發的操作、[狀態]=偵測到的電腦狀態' -Encoding UTF8
+            Add-Content -Path $actlog -Value '# Claude 續跑模式 活動記錄　—　[動作]=程式/你觸發的操作、[狀態]=電腦狀態；每行結尾｜後為電池/充電狀態' -Encoding UTF8
         }
         if ((Get-Item $actlog).Length -gt 262144) {
             Set-Content -Path $actlog -Value (Get-Content $actlog -Tail 300 -Encoding UTF8) -Encoding UTF8   # 超過 256KB 只留最後 300 行
         }
-        Add-Content -Path $actlog -Value ("[{0}] [{1}] {2}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $cat, $m) -Encoding UTF8
+        $ts = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+        $tag = Get-PowerTag
+        $line = if ($tag) { "[$ts] [$cat] $m  ｜$tag" } else { "[$ts] [$cat] $m" }
+        Add-Content -Path $actlog -Value $line -Encoding UTF8
     } catch {}
 }
 
@@ -41,18 +67,7 @@ try {
     $script:mtx = New-Object System.Threading.Mutex($true, 'Global\ClaudeKeepAwakeTray', [ref]$mtxCreated)
     if (-not $mtxCreated) { return }
 
-    # ---- 目前電源（插電 / 電池 %）----
-    function Power-Status {
-        try {
-            $ps = [System.Windows.Forms.SystemInformation]::PowerStatus
-            if ($ps.PowerLineStatus -eq 'Online') { return '插電' }
-            $pct = [int]($ps.BatteryLifePercent * 100)
-            if ($pct -gt 100) { return '電池（未知%）' }
-            return "電池 $pct%"
-        } catch { return '未知' }
-    }
-
-    # ---- 電源設定核心（並記錄實際改了哪兩個設定，當安全佐證）----
+    # ---- 電源設定核心（記錄實際改了哪兩個設定，當安全佐證）----
     $SUB = 'SUB_BUTTONS'
     $LidGuid = '5ca83367-6e45-459f-a27b-476b1d01c936'    # 闔蓋動作；勿用 $LID（會與 $lid 大小寫撞名）
     function Set-Lid([int]$v) {
@@ -165,7 +180,7 @@ try {
     $script:lastBeat = $null
     $script:armTimeoutMin = 5
 
-    # ---- Lid 感測器 + 閒置偵測 + 睡眠/喚醒偵測 ----
+    # ---- Lid 感測器 + 閒置偵測 + 睡眠/喚醒偵測（睡眠瞬間直接寫 log，因主程式那時已凍結）----
     $script:lid = $null
     try {
         Add-Type -ReferencedAssemblies 'System.Windows.Forms' -TypeDefinition @'
@@ -179,14 +194,25 @@ public class KA_LidWatcher : NativeWindow, IDisposable {
     static extern bool UnregisterPowerSettingNotification(IntPtr h);
     [DllImport("user32.dll")]
     static extern bool GetLastInputInfo(ref LASTINPUTINFO plii);
+    [DllImport("kernel32.dll")]
+    static extern bool GetSystemPowerStatus(out SPS s);
     [StructLayout(LayoutKind.Sequential)]
     struct LASTINPUTINFO { public uint cbSize; public uint dwTime; }
+    [StructLayout(LayoutKind.Sequential)]
+    struct SPS { public byte ac; public byte flag; public byte pct; public byte sys; public int t1; public int t2; }
     public static double IdleSeconds() {
         LASTINPUTINFO lii = new LASTINPUTINFO();
         lii.cbSize = (uint)Marshal.SizeOf(typeof(LASTINPUTINFO));
         if (!GetLastInputInfo(ref lii)) return 0;
         uint now = (uint)Environment.TickCount;
         return (now - lii.dwTime) / 1000.0;
+    }
+    static string PwTag() {
+        SPS s;
+        if (!GetSystemPowerStatus(out s)) return "電源未知";
+        if (s.ac == 1) return "插電";
+        if (s.pct <= 100) return "電池 " + s.pct + "%";
+        return "電池";
     }
     const int WM_POWERBROADCAST = 0x0218;
     const int PBT_POWERSETTINGCHANGE = 0x8013;
@@ -201,6 +227,14 @@ public class KA_LidWatcher : NativeWindow, IDisposable {
     public int ResumeCount = 0;           // 每次從睡眠喚醒 +1
     public DateTime SuspendAt = DateTime.MinValue;
     public DateTime ResumeAt = DateTime.MinValue;
+    public string LogPath = "";
+    void WriteLog(string cat, string msg) {
+        try {
+            if (string.IsNullOrEmpty(LogPath)) return;
+            string line = "[" + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + "] [" + cat + "] " + msg + "  ｜" + PwTag() + "\r\n";
+            System.IO.File.AppendAllText(LogPath, line, new System.Text.UTF8Encoding(false));
+        } catch {}
+    }
     public KA_LidWatcher() {
         this.CreateHandle(new CreateParams());
         hReg = RegisterPowerSettingNotification(this.Handle, ref LID, 0);
@@ -213,6 +247,7 @@ public class KA_LidWatcher : NativeWindow, IDisposable {
                 if (s.PowerSetting == LID) LidState = (int)s.Data;
             } else if (ev == PBT_APMSUSPEND) {
                 SuspendAt = DateTime.Now;
+                WriteLog("狀態", "電腦進入睡眠（即將睡眠）");
             } else if (ev == PBT_APMRESUMEAUTOMATIC || ev == PBT_APMRESUMESUSPEND) {
                 ResumeAt = DateTime.Now; ResumeCount++;
             }
@@ -226,6 +261,7 @@ public class KA_LidWatcher : NativeWindow, IDisposable {
 }
 '@
         $script:lid = New-Object KA_LidWatcher
+        $script:lid.LogPath = $actlog
     } catch { $script:lid = $null }
 
     function Get-Lid { if ($script:lid) { return [int]$script:lid.LidState } else { return -1 } }
@@ -297,7 +333,6 @@ public class KA_LidWatcher : NativeWindow, IDisposable {
         $script:st.Expiry = if ($script:st.Minutes -gt 0) { [DateTime]::Now.AddMinutes($script:st.Minutes) } else { $null }
         $script:lastBeat = [DateTime]::Now
         Update-UI
-        Log '狀態' ("開始續跑，電源：{0}" -f (Power-Status))
         $lbl = Mode-Label $script:st.Mode
         if ($script:st.Minutes -gt 0) {
             Show-Toast "Claude 續跑：已闔上，開始倒數（$lbl）⏳" '時間到、若你人不在就讓筆電睡眠；提早掀開會立即還原。'
@@ -317,7 +352,6 @@ public class KA_LidWatcher : NativeWindow, IDisposable {
         $lbl = Mode-Label $mode
         Show-Toast "Claude 續跑：已開啟（$lbl）✅" '闔上筆電後開始倒數；5 分鐘內沒闔上會自動取消並還原。'
         Log '動作' "開啟續跑：$lbl（等你闔上筆電後開始倒數）"
-        Log '狀態' ("接管當下電源：{0}" -f (Power-Status))
         # 已經闔著（clamshell）或沒有 lid 感測器 → 立即開始倒數
         if ((Get-Lid) -eq 0 -or (-not $script:lid)) { Start-Count }
     }
@@ -347,15 +381,14 @@ public class KA_LidWatcher : NativeWindow, IDisposable {
         $planned = $script:st.Expiry
         $lidClosed = ((Get-Lid) -eq 0)
         $idle = try { [KA_LidWatcher]::IdleSeconds() } catch { 999 }
-        $pw = Power-Status
         Restore-Normal
         Reset-State
         Update-UI
         $willSleep = ($lidClosed -and $idle -ge 60)
-        Log '狀態' ("倒數到期：預定 {0}、實際 {1}、筆電闔上={2}、閒置 {3} 秒、電源：{4}" -f $planned.ToString('HH:mm'), (Get-Date -Format 'HH:mm'), $(if ($lidClosed) { '是' } else { '否' }), [int]$idle, $pw)
+        Log '狀態' ("倒數到期：預定 {0}、實際 {1}、筆電闔上={2}、閒置 {3} 秒" -f $planned.ToString('HH:mm'), (Get-Date -Format 'HH:mm'), $(if ($lidClosed) { '是' } else { '否' }), [int]$idle)
         if ($willSleep) {
             Show-Toast "Claude 續跑：時間到（跑了約 $mins 分）💤" '已還原電源設定，讓筆電進入睡眠。'
-            Log '狀態' ("依預定時間讓電腦進入睡眠（{0}）" -f (Get-Date -Format 'HH:mm'))
+            Log '動作' ("時間到，依預定讓電腦進入睡眠（本次續跑 {0} 分）" -f $mins)
             Start-Sleep -Milliseconds 700
             [void][System.Windows.Forms.Application]::SetSuspendState([System.Windows.Forms.PowerState]::Suspend, $false, $false)
         } else {
@@ -390,7 +423,7 @@ public class KA_LidWatcher : NativeWindow, IDisposable {
     $script:timer = New-Object System.Windows.Forms.Timer
     $script:timer.Interval = 5000
     $script:timer.add_Tick({
-        # 從睡眠喚醒
+        # 從睡眠喚醒（睡眠那筆由背景元件在 suspend 當下已寫入）
         if ($script:lid -and $script:lid.ResumeCount -gt $script:prevResume) {
             $script:prevResume = $script:lid.ResumeCount
             if ($script:lid.SuspendAt -ne [DateTime]::MinValue -and $script:lid.ResumeAt -gt $script:lid.SuspendAt) {
@@ -415,7 +448,7 @@ public class KA_LidWatcher : NativeWindow, IDisposable {
                     if (($null -eq $script:lastBeat) -or (([DateTime]::Now - $script:lastBeat).TotalMinutes -ge 15)) {
                         $script:lastBeat = [DateTime]::Now
                         $rem = if ($script:st.Expiry) { "剩 $([int][math]::Ceiling(($script:st.Expiry - [DateTime]::Now).TotalMinutes)) 分" } else { '直到電力耗盡' }
-                        Log '狀態' ("續跑中… 電源：{0}，{1}" -f (Power-Status), $rem)
+                        Log '狀態' ("續跑中…（{0}）" -f $rem)
                     }
                     Update-UI
                 }
@@ -434,7 +467,6 @@ public class KA_LidWatcher : NativeWindow, IDisposable {
     Update-UI
     Log '動作' '程式啟動，待命中'
     Log '狀態' ("筆電開合感測器：{0}" -f $(if ($script:lid) { '正常' } else { '無法讀取（將以「按下即倒數」運作）' }))
-    Log '狀態' ("目前電源：{0}" -f (Power-Status))
 
     [System.Windows.Forms.Application]::add_ApplicationExit({ try { if ($script:st.Phase -ne 'off') { Restore-Normal } } catch {} })
     [System.Windows.Forms.Application]::Run()
