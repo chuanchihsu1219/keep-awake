@@ -68,4 +68,6 @@ irm https://raw.githubusercontent.com/chuanchihsu1219/keep-awake/main/install.ps
 Windows 10/11、內建的 Windows PowerShell 5.1。
 
 ## 授權 / 致謝
+程式碼採 [MIT](LICENSE) 授權 © 2026 Chuan-Chi Hsu。
+
 圖示 `coffee.png` 來自 [Twemoji](https://github.com/twitter/twemoji)（U+2615 HOT BEVERAGE），授權 **CC-BY 4.0**（詳見 `ICON-CREDIT.txt`）。
